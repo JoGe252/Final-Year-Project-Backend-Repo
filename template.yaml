@@ -1,0 +1,510 @@
+# CloudFormation template format version — always required at the top
+AWSTemplateFormatVersion: '2010-09-09'
+
+# Tells AWS this template uses the Serverless Application Model (SAM).
+# SAM extends CloudFormation with simplified serverless resource types
+# such as AWS::Serverless::Function and AWS::Serverless::HttpApi.
+Transform: AWS::Serverless-2016-10-31
+
+# Short description of what this stack deploys
+Description: Cloud Resume backend deployed with AWS SAM
+
+
+
+# ======================================================
+# PARAMETERS
+# ======================================================
+# Parameters allow the same template to be reused across environments
+# (dev, prod) without changing the infrastructure code itself.
+# Values can be overridden at deploy time via samconfig.toml or
+# the --parameter-overrides flag on sam deploy.
+Parameters:
+
+  # Controls which environment is being deployed.
+  # Used in resource names (e.g. feedback_table_prod vs feedback_table_dev)
+  # so dev and prod can coexist in the same AWS account without conflict.
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - prod
+
+  # The frontend domain allowed to call the API (used for CORS headers).
+  # "*" allows any origin and is acceptable for development.
+  # In production this should be locked to your CloudFront domain.
+  AllowedOrigin:
+    Type: String
+    Default: "https://d5xaoio1yn2zj.cloudfront.net"
+
+  # Language code passed to Amazon Comprehend for sentiment analysis.
+  # "en" = English. Change if feedback is expected in another language.
+  LanguageCode:
+    Type: String
+    Default: en
+
+  # Name of the S3 bucket where the downloadable CV PDF is stored.
+  # Must match the actual bucket name in your AWS account.
+  PdfBucket:
+    Type: String
+    Default: individualprojectjoel
+
+  # Object key (file name) of the PDF inside the S3 bucket.
+  # Must match the exact file name uploaded to S3.
+  PdfKey:
+    Type: String
+    Default: Joel-George-CV.pdf
+
+  # Email address Amazon SES will send feedback notifications to.
+  # This address must be verified in SES before deployment.
+  # To verify: AWS Console → SES → Verified Identities → Create Identity → Email
+  NotifyEmail:
+    Type: String
+    Default: "jkgeorge252@gmail.com"
+
+
+
+# ======================================================
+# GLOBALS
+# ======================================================
+# Globals apply shared settings to every Lambda function in the template.
+# This avoids repeating the same values inside each function definition.
+# Individual functions can still override these if needed.
+Globals:
+  Function:
+    # All Lambda functions use Python 3.12.
+    # This is a stable, AWS-supported runtime ensuring long-term compatibility.
+    Runtime: python3.12
+
+    # Maximum time a Lambda invocation is allowed to run before AWS terminates it.
+    # 10 seconds is generous for these lightweight functions.
+    Timeout: 10
+
+    # Memory allocated to each Lambda function (in MB).
+    # 128 MB is the minimum and is sufficient for these serverless functions.
+    MemorySize: 128
+
+    # CPU architecture. x86_64 is the standard and has the widest support.
+    Architectures:
+      - x86_64
+
+    # Environment variables shared across ALL Lambda functions.
+    # Function-specific variables are defined inside each function block below.
+    Environment:
+      Variables:
+        # Every Lambda uses ALLOWED_ORIGIN to set CORS response headers,
+        # so it lives here in globals rather than being repeated in each function.
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+
+
+
+# ======================================================
+# RESOURCES
+# ======================================================
+# Resources define the actual AWS services SAM/CloudFormation will create,
+# update, or delete when the stack is deployed.
+Resources:
+
+  # -------------------------------------------------------
+  # API GATEWAY
+  # HTTP API that exposes all backend endpoints to the frontend.
+  # HTTP API is used instead of REST API — it is faster, cheaper,
+  # and sufficient for this project's needs.
+  # -------------------------------------------------------
+  ResumeApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # The stage name becomes part of the URL path (e.g. /prod/count)
+      StageName: !Ref EnvironmentName
+
+      # CORS configuration is required so browsers allow the frontend
+      # JavaScript to call this API from a different domain.
+      # Without CORS the browser blocks the request before it reaches the API.
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS   # OPTIONS is required for CORS preflight requests
+        AllowHeaders:
+          - Content-Type
+
+
+  # -------------------------------------------------------
+  # DYNAMODB — Visitor Counter Table
+  # Stores a single item that tracks the total number of site visits.
+  # The counter is incremented atomically by the UpdateVisitorCountFunction.
+  # -------------------------------------------------------
+  VisitorCounterTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # Table name includes the environment name to avoid dev/prod conflicts
+      TableName: !Sub visitor_counter_${EnvironmentName}
+
+      # PAY_PER_REQUEST charges per read/write rather than reserved capacity.
+      # Ideal for low or unpredictable traffic — no over-provisioning costs.
+      BillingMode: PAY_PER_REQUEST
+
+      # Define the primary key attribute type
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S   # S = String
+
+      # Set the partition key — the unique identifier for each item
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+
+  # -------------------------------------------------------
+  # DYNAMODB — Feedback Table
+  # Stores contact form submissions along with sentiment analysis results
+  # from Amazon Comprehend. Records include a TTL field so old entries
+  # are automatically deleted after 90 days.
+  # -------------------------------------------------------
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # Table name includes the environment name to avoid dev/prod conflicts
+      TableName: !Sub feedback_table_${EnvironmentName}
+
+      # On-demand billing scales automatically with request volume
+      BillingMode: PAY_PER_REQUEST
+
+      # Define the primary key attribute type
+      AttributeDefinitions:
+        - AttributeName: feedbackId
+          AttributeType: S   # S = String (UUID generated by the Lambda)
+
+      # Set the partition key
+      KeySchema:
+        - AttributeName: feedbackId
+          KeyType: HASH
+
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+
+  # -------------------------------------------------------
+  # LAMBDA — Visitor Counter
+  # Triggered by GET /count
+  # Atomically increments the visitor count in DynamoDB and returns
+  # the updated value to the frontend for display.
+  # -------------------------------------------------------
+  UpdateVisitorCountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Path to the folder containing this Lambda's source code
+      CodeUri: count/
+
+      # Entry point: filename (app) dot function name (lambda_handler)
+      Handler: app.lambda_handler
+
+      # Environment variables specific to this function
+      Environment:
+        Variables:
+          # DynamoDB table name passed in at deploy time
+          TABLE_NAME: !Ref VisitorCounterTable
+
+          # Partition key value for the single counter record
+          COUNTER_ID: main
+
+      # IAM policy — DynamoDBCrudPolicy grants read/write access to the table.
+      # Only this table is accessible — principle of least privilege.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VisitorCounterTable
+
+      # API Gateway route that triggers this Lambda
+      Events:
+        CountGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ResumeApi
+            Path: /count
+            Method: GET
+
+
+  # -------------------------------------------------------
+  # LAMBDA — Submit Feedback
+  # Triggered by POST /feedback
+  # Validates the submitted form data, runs Amazon Comprehend sentiment
+  # analysis, stores the result in DynamoDB, and sends an email
+  # notification via Amazon SES.
+  # -------------------------------------------------------
+  SubmitFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Path to the folder containing this Lambda's source code
+      CodeUri: submit_feedback/
+
+      # Entry point: filename (app) dot function name (lambda_handler)
+      Handler: app.lambda_handler
+
+      # Environment variables specific to this function
+      Environment:
+        Variables:
+          # DynamoDB table name for storing feedback records
+          FEEDBACK_TABLE: !Ref FeedbackTable
+
+          # Language code for Amazon Comprehend sentiment analysis
+          LANGUAGE_CODE: !Ref LanguageCode
+
+          # Email address SES notifies when new feedback is received.
+          # Must be a verified SES identity before deployment.
+          NOTIFY_EMAIL: !Ref NotifyEmail
+
+      # IAM permissions — each permission is scoped to what this function
+      # actually needs, following the principle of least privilege.
+      Policies:
+        # Full CRUD access to the feedback table for writing new submissions
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+
+        # Permission to call Amazon Comprehend DetectSentiment.
+        # Returns POSITIVE, NEGATIVE, NEUTRAL, or MIXED + confidence scores.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - comprehend:DetectSentiment
+              Resource: "*"
+
+        # Permission to send email notifications via Amazon SES.
+        # Used to alert you when a new message is submitted via the contact form.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+              Resource: "*"
+
+      # API Gateway route that triggers this Lambda
+      Events:
+        FeedbackPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ResumeApi
+            Path: /feedback
+            Method: POST
+
+
+  # -------------------------------------------------------
+  # LAMBDA — Get Feedback
+  # Triggered by GET /feedback
+  # Returns stored feedback records from DynamoDB.
+  # Read-only — does not write to the table.
+  # -------------------------------------------------------
+  GetFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Path to the folder containing this Lambda's source code
+      CodeUri: get_feedback/
+
+      # Entry point: filename (app) dot function name (lambda_handler)
+      Handler: app.lambda_handler
+
+      # Environment variables specific to this function
+      Environment:
+        Variables:
+          # DynamoDB table name for reading feedback records
+          FEEDBACK_TABLE: !Ref FeedbackTable
+
+      # Read-only access is sufficient — this function never writes.
+      # DynamoDBReadPolicy grants GetItem, Query, Scan, BatchGetItem only.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackTable
+
+      # API Gateway route that triggers this Lambda
+      Events:
+        FeedbackGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ResumeApi
+            Path: /feedback
+            Method: GET
+
+
+  # -------------------------------------------------------
+  # LAMBDA — Resume PDF
+  # Triggered by GET /resume/pdf
+  # Retrieves the CV PDF from S3 and returns it as a downloadable file.
+  # The browser either downloads or opens the PDF depending on settings.
+  # -------------------------------------------------------
+  GenerateResumePdfFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Path to the folder containing this Lambda's source code
+      CodeUri: resume_pdf/
+
+      # Entry point: filename (app) dot function name (lambda_handler)
+      Handler: app.lambda_handler
+
+      # Environment variables specific to this function
+      Environment:
+        Variables:
+          # S3 bucket name where the CV PDF is stored
+          PDF_BUCKET: !Ref PdfBucket
+
+          # Object key (file name) of the PDF in the S3 bucket
+          PDF_KEY: !Ref PdfKey
+
+      # IAM permission scoped to only the specific PDF file in S3.
+      # Restricting to one object rather than the whole bucket demonstrates
+      # least privilege — the Lambda cannot access any other S3 objects.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              # Restricts access to just this one file, not the whole bucket
+              Resource: !Sub arn:aws:s3:::${PdfBucket}/${PdfKey}
+
+      # API Gateway route that triggers this Lambda
+      Events:
+        ResumePdfGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ResumeApi
+            Path: /resume/pdf
+            Method: GET
+
+
+  # -------------------------------------------------------
+  # LAMBDA — Admin Summary
+  # Triggered by GET /admin/summary
+  # Returns a summary of site metrics for the admin dashboard:
+  # total visitor count and all feedback submissions with sentiment data.
+  # -------------------------------------------------------
+  AdminSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Path to the folder containing this Lambda's source code
+      CodeUri: admin_summary/
+
+      # Entry point: filename (app) dot function name (lambda_handler)
+      Handler: app.lambda_handler
+
+      # Environment variables specific to this function
+      Environment:
+        Variables:
+          # Visitor counter table — read to get total visit count
+          VISITOR_TABLE: !Ref VisitorCounterTable
+
+          # Feedback table — read to get all submissions and sentiment data
+          FEEDBACK_TABLE: !Ref FeedbackTable
+
+          # Partition key value for the single visitor counter record
+          COUNTER_ID: main
+
+      # Read-only access to both tables — this function never writes
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref VisitorCounterTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackTable
+
+      # API Gateway route that triggers this Lambda
+      Events:
+        AdminSummaryGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ResumeApi
+            Path: /admin/summary
+            Method: GET
+
+
+  # -------------------------------------------------------
+  # LAMBDA — Admin Alerts
+  # Triggered by GET /admin/alerts
+  # Analyses recent feedback and visitor data to generate a list of
+  # alerts for the admin dashboard (e.g. negative sentiment detected,
+  # traffic milestones reached).
+  # -------------------------------------------------------
+  AdminAlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Path to the folder containing this Lambda's source code
+      CodeUri: admin_alerts/
+
+      # Entry point: filename (app) dot function name (lambda_handler)
+      Handler: app.lambda_handler
+
+      # Environment variables specific to this function
+      Environment:
+        Variables:
+          # Visitor counter table — read to check for traffic milestones
+          VISITOR_TABLE: !Ref VisitorCounterTable
+
+          # Feedback table — read to detect negative sentiment or high volume
+          FEEDBACK_TABLE: !Ref FeedbackTable
+
+          # Partition key value for the single visitor counter record
+          COUNTER_ID: main
+
+      # Read-only access to both tables — this function never writes
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref VisitorCounterTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackTable
+
+      # API Gateway route that triggers this Lambda
+      Events:
+        AdminAlertsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ResumeApi
+            Path: /admin/alerts
+            Method: GET
+
+
+
+# ======================================================
+# OUTPUTS
+# ======================================================
+# Outputs are displayed after a successful deployment.
+# They make it easy to find live URLs and resource names
+# without searching through the AWS Console manually.
+Outputs:
+
+  # Base URL of the deployed API Gateway stage
+  ApiBaseUrl:
+    Description: Base URL for the deployed API
+    Value: !Sub "https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}"
+
+  # Full URL for the visitor counter endpoint
+  CountEndpoint:
+    Description: Count endpoint
+    Value: !Sub "https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/count"
+
+  # Full URL for the feedback submission and retrieval endpoint
+  FeedbackEndpoint:
+    Description: Feedback endpoint
+    Value: !Sub "https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/feedback"
+
+  # Full URL for the CV PDF download endpoint
+  ResumePdfEndpoint:
+    Description: Resume PDF endpoint
+    Value: !Sub "https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/resume/pdf"
+
+  # DynamoDB table name for the visitor counter (useful for console lookup)
+  VisitorCounterTableName:
+    Description: Visitor counter DynamoDB table name
+    Value: !Ref VisitorCounterTable
+
+  # DynamoDB table name for feedback records (useful for console lookup)
+  FeedbackTableName:
+    Description: Feedback DynamoDB table name
+    Value: !Ref FeedbackTable
+
+  # Full URL for the admin summary endpoint
+  AdminSummaryEndpoint:
+    Description: Admin summary endpoint
+    Value: !Sub "https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/admin/summary"
+
+  # Full URL for the admin alerts endpoint
+  AdminAlertsEndpoint:
+    Description: Admin alerts endpoint
+    Value: !Sub "https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/admin/alerts"
